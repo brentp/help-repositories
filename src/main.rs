@@ -1,5 +1,3 @@
-use std::ops::{Deref, DerefMut};
-
 use v8;
 
 #[derive(Debug)]
@@ -33,15 +31,21 @@ impl Variant {
 
 /*
 impl Drop for Variant {
-    // doesn't get called until v8 is disposed
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+    }
 }
 */
 
-impl v8::cppgc::GarbageCollected for Variant {}
+unsafe impl v8::cppgc::GarbageCollected for Variant {
+    fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
+
+    fn get_name(&self) -> &'static std::ffi::CStr {
+        c"Variant"
+    }
+}
 
 fn attr_getter(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     key: v8::Local<v8::Name>,
     args: v8::PropertyCallbackArguments,
     mut rv: v8::ReturnValue,
@@ -50,7 +54,7 @@ fn attr_getter(
 
     let wrapper = unsafe { v8::Object::unwrap::<TAG, Variant>(scope, this) }
         .expect("Failed to unwrap VariantWrapper");
-    let variant = &*wrapper;
+    let variant = unsafe { wrapper.as_ref() };
 
     match key.to_rust_string_lossy(scope).as_bytes() {
         b"start" => {
@@ -60,8 +64,7 @@ fn attr_getter(
             rv.set(v8::Number::new(scope, variant.end() as f64).into());
         }
         b"chrom" => {
-            let name = variant.chrom();
-            let name_str = v8::String::new(scope, name).unwrap();
+            let name_str = v8::String::new(scope, variant.chrom()).unwrap();
             rv.set(name_str.into());
         }
         _ => {
@@ -75,7 +78,7 @@ fn attr_getter(
 const TAG: u16 = 1;
 
 fn create_object_template<'a>(
-    scope: &mut v8::HandleScope<'a>,
+    scope: &mut v8::PinScope<'a, '_>,
 ) -> v8::Local<'a, v8::ObjectTemplate> {
     let object_template = v8::ObjectTemplate::new(scope);
     object_template.set_internal_field_count(1);
@@ -91,102 +94,100 @@ fn create_object_template<'a>(
 }
 
 fn create_variant_object<'a>(
-    scope: &mut v8::HandleScope<'a>,
+    scope: &mut v8::PinScope<'a, '_>,
     object_template: v8::Local<'a, v8::ObjectTemplate>,
     variant: Variant,
 ) -> v8::Local<'a, v8::Object> {
-    let object = object_template.new_instance(scope).unwrap();
+    let object = object_template
+        .new_instance(scope)
+        .expect("failed to create Variant instance");
 
-    let wrapper = unsafe {
-        v8::cppgc::make_garbage_collected::<Variant>(scope.get_cpp_heap().unwrap(), variant)
-    };
+    let wrapper = unsafe { v8::cppgc::make_garbage_collected(scope.get_cpp_heap().unwrap(), variant) };
 
     unsafe {
         v8::Object::wrap::<TAG, Variant>(scope, object, &wrapper);
     }
-
-    // Calculate and report the memory used by Variant
-    let variant_size = std::mem::size_of::<Variant>();
-    scope.adjust_amount_of_external_allocated_memory(variant_size as i64);
 
     object
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize V8 with cppgc
-    //let platform = v8::new_default_platform(0, false).make_shared();
     let platform = v8::new_unprotected_default_platform(0, false).make_shared();
-    /*
-    v8::V8::set_flags_from_string(
-        "--no_freeze_flags_after_init --expose-gc --trace_gc --trace_gc_verbose --trace_gc_timer",
-    );
-    */
+
+    v8::V8::set_flags_from_string("--no_freeze_flags_after_init --expose-gc");
 
     v8::V8::initialize_platform(platform.clone());
+    v8::cppgc::initialize_process(platform.clone());
     v8::V8::initialize();
-    v8::cppgc::initalize_process(platform.clone());
 
-    let mut heap =
-        v8::cppgc::Heap::create(platform.clone(), v8::cppgc::HeapCreateParams::default());
+    {
+        let heap = v8::cppgc::Heap::create(platform, v8::cppgc::HeapCreateParams::default());
+        let isolate = &mut v8::Isolate::new(v8::CreateParams::default().cpp_heap(heap));
 
-    //let isolate = &mut v8::Isolate::new(v8::CreateParams::default().cpp_heap(heap));
-    let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
-    isolate.attach_cpp_heap(&mut heap);
+        v8::scope!(handle_scope, isolate);
+        let context = v8::Context::new(handle_scope, Default::default());
+        let scope = &mut v8::ContextScope::new(handle_scope, context);
 
-    let handle_scope = &mut v8::HandleScope::new(isolate);
-    let context = v8::Context::new(handle_scope, Default::default());
-    let scope = &mut v8::ContextScope::new(handle_scope, context);
+        let object_template_local = create_object_template(scope);
+        let object_template = v8::Global::new(scope, object_template_local);
 
-    let object_template = create_object_template(scope);
-    let code = v8::String::new(scope, "variant.start").unwrap();
-    let script = v8::Script::compile(scope, code, None).unwrap();
-    let global = context.global(scope);
-    let variant_name = v8::String::new(scope, "variant").unwrap();
+        let code = v8::String::new(scope, "variant.start").unwrap();
+        let script = v8::Script::compile(scope, code, None).unwrap();
+        let global = context.global(scope);
+        let variant_name = v8::String::new(scope, "variant").unwrap();
 
-    let n = 2000000;
-    for i in 0..n {
-        let record = Variant::new("chr1".to_string(), i, i + 1);
-        //scope.clear_kept_objects();
+        fn current_rss_kb() -> Option<usize> {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    return rest.trim().split_whitespace().next()?.parse().ok();
+                }
+            }
+            None
+        }
 
-        //let local_scope = &mut *scope;
-        // deref the scope into another scope
-        {
-            let local_scope = &mut v8::HandleScope::new(scope);
+        let n = 200_000_000;
+        for i in 0..n {
+            let record = Variant::new("chr1".to_string(), i, i + 1);
 
-            let variant_object = create_variant_object(local_scope, object_template, record);
-            global.set(local_scope, variant_name.into(), variant_object.into());
+            // Create a fresh scope each loop, so Local handles drop.
+            v8::scope!(loop_scope, scope);
+            let object_template = v8::Local::new(loop_scope, &object_template);
+
+            let variant_object = create_variant_object(loop_scope, object_template, record);
+            global.set(loop_scope, variant_name.into(), variant_object.into());
 
             // Run the JavaScript code
-            let result = script.run(local_scope).unwrap();
-            //global.delete(local_scope, variant_name.into());
+            let result = script.run(loop_scope).unwrap();
 
             // Convert the result to a string and print it
-            let result_str = result.to_string(local_scope).unwrap();
-            if i % 1000 == 0 {
+            /*
+            if i % 500_000 == 0 {
+                let result_str = result.to_string(loop_scope).unwrap();
+                let rss_kb = current_rss_kb().unwrap_or(0);
                 println!(
-                    "variant.start: {}, /{}",
-                    result_str.to_rust_string_lossy(local_scope),
-                    n
+                    "variant.start: {}, /{} (VmRSS {} KB)",
+                    result_str.to_rust_string_lossy(loop_scope),
+                    n,
+                    rss_kb
                 );
             }
-            //local_scope.clear_kept_objects();
-        }
+            */
 
-        /*
-        if i % 100000 == 0 {
-            scope.low_memory_notification();
-            scope.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
-            unsafe {
-                scope.get_cpp_heap().unwrap().collect_garbage_for_testing(
-                    v8::cppgc::EmbedderStackState::MayContainHeapPointers,
-                );
+            // Periodically force GC to observe steady-state behavior.
+            if i % 1_000_000 == 0 {
+                loop_scope.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
+                unsafe {
+                    loop_scope
+                        .get_cpp_heap()
+                        .unwrap()
+                        .collect_garbage_for_testing(v8::cppgc::EmbedderStackState::MayContainHeapPointers);
+                }
             }
-            // Report memory decrease after garbage collection
-            //let variant_size = std::mem::size_of::<Variant>();
-            //scope.adjust_amount_of_external_allocated_memory(-(variant_size as i64 * 100000));
         }
-        */
     }
+
     // cleanup
     unsafe {
         v8::cppgc::shutdown_process();
