@@ -1,61 +1,63 @@
-use std::sync::Arc;
+use rust_htslib::bcf::{self, Read};
 use v8;
+
+type AnyError = Box<dyn std::error::Error>;
+
+const TAG: u16 = 1;
+const V8_FLAGS: &str = "--no_freeze_flags_after_init --expose-gc";
+const GC_EVERY: usize = 100_000;
+const VARIANT_TYPE_NAME: &[u8] = b"Variant\0";
 
 #[derive(Debug)]
 struct Variant {
-    _chrom: String,
-    _start: i32,
-    _end: i32,
-    _make_this_use_memory: [u64; 128]
+    record: bcf::Record,
+    chrom: String,
 }
 
 impl Variant {
-    fn new(chrom: String, start: i32, end: i32) -> Self {
-        Self { _chrom: chrom, _start: start, _end: end, _make_this_use_memory: [0; 128] }
+    fn from_record(mut record: bcf::Record) -> Self {
+        record.unpack();
+        let chrom = match record.rid() {
+            Some(rid) => record
+                .header()
+                .rid2name(rid)
+                .ok()
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+                .unwrap_or_else(|| ".".to_string()),
+            None => ".".to_string(),
+        };
+        Self { record, chrom }
     }
 
     fn start(&self) -> i64 {
-        self._start as i64
+        self.record.pos()
     }
     fn end(&self) -> i64 {
-        self._end as i64
+        self.record.end()
     }
     fn chrom(&self) -> &str {
-        &self._chrom
+        &self.chrom
     }
 }
 
-impl Drop for Variant {
-    // never gets called.
-    fn drop(&mut self) {
-        eprintln!("Dropping variant");
-    }
-}
+unsafe impl v8::cppgc::GarbageCollected for Variant {
+    fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
 
-// Change VariantWrapper to use a raw pointer instead of Arc
-struct VariantWrapper {
-    variant: *const Variant,
-}
-
-impl v8::cppgc::GarbageCollected for VariantWrapper {
-    fn trace(&self, _visitor: &v8::cppgc::Visitor) {
-        // We don't need to trace the raw pointer
+    fn get_name(&self) -> &'static std::ffi::CStr {
+        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(VARIANT_TYPE_NAME) }
     }
 }
 
 fn attr_getter(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
     key: v8::Local<v8::Name>,
     args: v8::PropertyCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
     let this = args.this();
-    let wrapper = unsafe {
-        let internal_field = this.get_internal_field(scope, 0).unwrap();
-        let external: v8::Local<v8::External> = v8::Local::cast(internal_field);
-        &*(external.value() as *const VariantWrapper)
-    };
-    let variant = unsafe { &*wrapper.variant };
+    let wrapper = unsafe { v8::Object::unwrap::<TAG, Variant>(scope, this) }
+        .expect("Failed to unwrap Variant");
+    let variant = unsafe { wrapper.as_ref() };
 
     match key.to_rust_string_lossy(scope).as_bytes() {
         b"start" => {
@@ -77,12 +79,9 @@ fn attr_getter(
     }
 }
 
-const TAG: u16 = 1;
-
-fn create_variant_object<'a>(
-    scope: &mut v8::HandleScope<'a>,
-    variant: Arc<Variant>,
-) -> v8::Local<'a, v8::Object> {
+fn create_object_template<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+) -> v8::Local<'a, v8::ObjectTemplate> {
     let object_template = v8::ObjectTemplate::new(scope);
     object_template.set_internal_field_count(1);
 
@@ -93,73 +92,104 @@ fn create_variant_object<'a>(
     object_template.set_accessor(stop_name.into(), attr_getter);
     object_template.set_accessor(chrom_name.into(), attr_getter);
 
-    let object = object_template.new_instance(scope).unwrap();
+    object_template
+}
 
-    let wrapper = unsafe { v8::cppgc::make_garbage_collected::<VariantWrapper>(
-        scope.get_cpp_heap().unwrap(),
-        VariantWrapper { variant: Arc::into_raw(variant) },
-    )};
-    let wrapper_ptr = &*wrapper as *const VariantWrapper;
-    let external = v8::External::new(scope, wrapper_ptr as *mut _);
-    object.set_internal_field(0, external.into());
+fn create_variant_object<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    object_template: v8::Local<'a, v8::ObjectTemplate>,
+    variant: Variant,
+) -> v8::Local<'a, v8::Object> {
+    let object = object_template
+        .new_instance(scope)
+        .expect("failed to create Variant instance");
+
+    let wrapper =
+        unsafe { v8::cppgc::make_garbage_collected(scope.get_cpp_heap().unwrap(), variant) };
+    unsafe {
+        v8::Object::wrap::<TAG, Variant>(scope, object, &wrapper);
+    }
 
     object
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn maybe_force_gc(scope: &mut v8::PinScope<'_, '_>) {
+    scope.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
+    unsafe {
+        scope.get_cpp_heap()
+            .unwrap()
+            .collect_garbage_for_testing(v8::cppgc::EmbedderStackState::MayContainHeapPointers);
+    }
+}
+
+fn run(path: &str, js_expr: &str) -> Result<(), AnyError> {
     // Initialize V8 with cppgc
-    let platform = v8::new_default_platform(0, false).make_shared();
+    let platform = v8::new_unprotected_default_platform(0, false).make_shared();
+    v8::V8::set_flags_from_string(V8_FLAGS);
+
     v8::V8::initialize_platform(platform.clone());
+    v8::cppgc::initialize_process(platform.clone());
     v8::V8::initialize();
 
-    v8::cppgc::initalize_process(platform.clone());
+    {
+        let heap = v8::cppgc::Heap::create(platform, v8::cppgc::HeapCreateParams::default());
+        let isolate = &mut v8::Isolate::new(v8::CreateParams::default().cpp_heap(heap));
 
-    let heap =
-    v8::cppgc::Heap::create(platform.clone(), v8::cppgc::HeapCreateParams::default());
+        v8::scope!(handle_scope, isolate);
+        let context = v8::Context::new(handle_scope, Default::default());
+        let scope = &mut v8::ContextScope::new(handle_scope, context);
 
-    let isolate = &mut v8::Isolate::new(v8::CreateParams::default().cpp_heap(heap));
+        let object_template_local = create_object_template(scope);
+        let object_template = v8::Global::new(scope, object_template_local);
 
-    let handle_scope = &mut v8::HandleScope::new(isolate);
-    let context = v8::Context::new(handle_scope, Default::default());
-    let scope = &mut v8::ContextScope::new(handle_scope, context);
+        let mut reader = bcf::Reader::from_path(path)?;
 
-    let n = 1000000;
-    for i in 0..n {
-        //isolate.adjust_amount_of_external_allocated_memory(128);
-        let record = Variant::new("chr1".to_string(), i, i + 1);
-        let variant = Arc::new(record);
-
-        // Create the variant object in V8
-        let variant_object = create_variant_object(scope, variant.clone());
-
-        // Set the variant object in the global context
+        let code = v8::String::new(scope, js_expr).unwrap();
+        let script = v8::Script::compile(scope, code, None).unwrap();
         let global = context.global(scope);
         let variant_name = v8::String::new(scope, "variant").unwrap();
-        global.set(scope, variant_name.into(), variant_object.into());
 
-        // Run the JavaScript code
-        let code = v8::String::new(scope, "variant.start").unwrap();
-        let script = v8::Script::compile(scope, code, None).unwrap();
-        let result = script.run(scope).unwrap();
-        global.delete(scope, variant_name.into());
+        for (i, result) in reader.records().enumerate() {
+            let record = result?;
+            let record = Variant::from_record(record);
 
-        // Convert the result to a string and print it
-        let result_str = result.to_string(scope).unwrap();
-        println!("variant.start: {}, /{}", result_str.to_rust_string_lossy(scope), n);
+            // Fresh scope each loop so Local handles drop promptly.
+            v8::scope!(loop_scope, scope);
+            let object_template = v8::Local::new(loop_scope, &object_template);
+
+            let variant_object = create_variant_object(loop_scope, object_template, record);
+            global.set(loop_scope, variant_name.into(), variant_object.into());
+
+            let result = script.run(loop_scope).unwrap();
+            let result_str = result.to_string(loop_scope).unwrap();
+            println!("{}", result_str.to_rust_string_lossy(loop_scope));
+
+            // Periodically force GC to observe steady-state behavior.
+            if i != 0 && i % GC_EVERY == 0 {
+                maybe_force_gc(loop_scope);
+            }
+        }
     }
 
-    // Perform garbage collection
-    scope.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
-
+    // cleanup
     unsafe {
+        v8::cppgc::shutdown_process();
         v8::V8::dispose();
-        v8::V8::dispose_platform();
     }
-    eprintln!("done");
-    // sleep for 100 seconds
-    std::thread::sleep(std::time::Duration::from_secs(20));
+    v8::V8::dispose_platform();
 
+    eprintln!("done");
     Ok(())
 }
 
-
+fn main() -> Result<(), AnyError> {
+    let mut args = std::env::args();
+    let program = args.next().unwrap_or_else(|| "v8_hts".to_string());
+    let Some(path) = args.next() else {
+        eprintln!("usage: {program} <input.vcf|input.bcf> [js_expr]");
+        eprintln!("example: {program} input.vcf.gz 'variant.chrom + \":\" + variant.start'");
+        return Ok(());
+    };
+    let js_expr = args.next().unwrap_or_else(|| "variant.start".to_string());
+    run(&path, &js_expr)
+}
