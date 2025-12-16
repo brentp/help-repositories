@@ -1,52 +1,15 @@
 use rust_htslib::bcf::{self, Read};
 use v8;
 
+mod variant;
+
+use variant::{InfoField, InfoValue, Variant};
+
 type AnyError = Box<dyn std::error::Error>;
 
 const TAG: u16 = 1;
 const V8_FLAGS: &str = "--no_freeze_flags_after_init --expose-gc";
 const GC_EVERY: usize = 100_000;
-const VARIANT_TYPE_NAME: &[u8] = b"Variant\0";
-
-#[derive(Debug)]
-struct Variant {
-    record: bcf::Record,
-    chrom: String,
-}
-
-impl Variant {
-    fn from_record(mut record: bcf::Record) -> Self {
-        record.unpack();
-        let chrom = match record.rid() {
-            Some(rid) => record
-                .header()
-                .rid2name(rid)
-                .ok()
-                .map(|name| String::from_utf8_lossy(name).into_owned())
-                .unwrap_or_else(|| ".".to_string()),
-            None => ".".to_string(),
-        };
-        Self { record, chrom }
-    }
-
-    fn start(&self) -> i64 {
-        self.record.pos()
-    }
-    fn end(&self) -> i64 {
-        self.record.end()
-    }
-    fn chrom(&self) -> &str {
-        &self.chrom
-    }
-}
-
-unsafe impl v8::cppgc::GarbageCollected for Variant {
-    fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
-
-    fn get_name(&self) -> &'static std::ffi::CStr {
-        unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(VARIANT_TYPE_NAME) }
-    }
-}
 
 fn attr_getter(
     scope: &mut v8::PinScope<'_, '_>,
@@ -63,18 +26,110 @@ fn attr_getter(
         b"start" => {
             rv.set(v8::Number::new(scope, variant.start() as f64).into());
         }
+        b"pos" => {
+            rv.set(v8::Number::new(scope, variant.pos() as f64).into());
+        }
         b"stop" => {
             rv.set(v8::Number::new(scope, variant.end() as f64).into());
         }
         b"chrom" => {
-            let name = variant.chrom();
-            let name_str = v8::String::new(scope, name).unwrap();
+            let name_str = v8::String::new(scope, variant.chrom()).unwrap();
             rv.set(name_str.into());
         }
+        b"id" => {
+            let s = v8::String::new(scope, &variant.id()).unwrap();
+            rv.set(s.into());
+        }
+        b"ref" => {
+            let s = v8::String::new(scope, &variant.reference()).unwrap();
+            rv.set(s.into());
+        }
+        b"alt" => {
+            let values = variant
+                .alts()
+                .into_iter()
+                .map(|s| v8::String::new(scope, &s).unwrap().into())
+                .collect::<Vec<v8::Local<v8::Value>>>();
+            let arr = v8::Array::new_with_elements(scope, &values);
+            rv.set(arr.into());
+        }
+        b"qual" => match variant.qual() {
+            Some(q) => rv.set(v8::Number::new(scope, q as f64).into()),
+            None => rv.set(v8::null(scope).into()),
+        },
         _ => {
             let message = v8::String::new(scope, "Invalid key").unwrap();
             let error = v8::Exception::error(scope, message);
             rv.set(error.into());
+        }
+    }
+}
+
+fn info_fn(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let this = args.this();
+    let wrapper = unsafe { v8::Object::unwrap::<TAG, Variant>(scope, this) }
+        .expect("Failed to unwrap Variant");
+    let variant = unsafe { wrapper.as_ref() };
+
+    if args.length() < 1 {
+        rv.set(v8::undefined(scope).into());
+        return;
+    }
+
+    let tag = args.get(0);
+    let Ok(tag_str) = v8::Local::<v8::String>::try_from(tag) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    let tag = tag_str.to_rust_string_lossy(scope);
+
+    let value = match variant.info(tag.as_bytes()) {
+        Ok(v) => v,
+        Err(_) => {
+            rv.set(v8::undefined(scope).into());
+            return;
+        }
+    };
+
+    match value {
+        None => rv.set(v8::undefined(scope).into()),
+        Some(InfoValue::Flag(b)) => rv.set(v8::Boolean::new(scope, b).into()),
+        Some(InfoValue::Integer(field)) => rv.set(field_to_value(scope, field, |scope, v| {
+            v8::Number::new(scope, v as f64).into()
+        })),
+        Some(InfoValue::Float(field)) => rv.set(field_to_value(scope, field, |scope, v| {
+            v8::Number::new(scope, v as f64).into()
+        })),
+        Some(InfoValue::String(field)) => rv.set(field_to_value(scope, field, |scope, v| {
+            v8::String::new(scope, &v).unwrap().into()
+        })),
+    }
+}
+
+fn field_to_value<'s, 'i, T>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    field: InfoField<T>,
+    mut to_value: impl FnMut(&mut v8::PinScope<'s, 'i>, T) -> v8::Local<'s, v8::Value>,
+) -> v8::Local<'s, v8::Value> {
+    match field {
+        InfoField::Scalar(v) => match v {
+            Some(v) => to_value(scope, v),
+            None => v8::null(scope).into(),
+        },
+        InfoField::Array(values) => {
+            let arr = v8::Array::new(scope, values.len() as i32);
+            for (i, v) in values.into_iter().enumerate() {
+                let v = match v {
+                    Some(v) => to_value(scope, v),
+                    None => v8::null(scope).into(),
+                };
+                arr.set_index(scope, i as u32, v);
+            }
+            arr.into()
         }
     }
 }
@@ -85,12 +140,14 @@ fn create_object_template<'a>(
     let object_template = v8::ObjectTemplate::new(scope);
     object_template.set_internal_field_count(1);
 
-    let start_name = v8::String::new(scope, "start").unwrap();
-    let stop_name = v8::String::new(scope, "stop").unwrap();
-    let chrom_name = v8::String::new(scope, "chrom").unwrap();
-    object_template.set_accessor(start_name.into(), attr_getter);
-    object_template.set_accessor(stop_name.into(), attr_getter);
-    object_template.set_accessor(chrom_name.into(), attr_getter);
+    for key in ["start", "pos", "stop", "chrom", "id", "ref", "alt", "qual"] {
+        let name = v8::String::new(scope, key).unwrap();
+        object_template.set_accessor(name.into(), attr_getter);
+    }
+
+    let info_key = v8::String::new(scope, "info").unwrap();
+    let info_template = v8::FunctionTemplate::new(scope, info_fn);
+    object_template.set(info_key.into(), info_template.into());
 
     object_template
 }
@@ -192,4 +249,76 @@ fn main() -> Result<(), AnyError> {
     };
     let js_expr = args.next().unwrap_or_else(|| "variant.start".to_string());
     run(&path, &js_expr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static V8_LOCK: Mutex<()> = Mutex::new(());
+    static PLATFORM: OnceLock<v8::SharedRef<v8::Platform>> = OnceLock::new();
+
+    fn ensure_v8_initialized() -> &'static v8::SharedRef<v8::Platform> {
+        PLATFORM.get_or_init(|| {
+            let platform = v8::new_unprotected_default_platform(0, false).make_shared();
+            v8::V8::set_flags_from_string(V8_FLAGS);
+            v8::V8::initialize_platform(platform.clone());
+            v8::cppgc::initialize_process(platform.clone());
+            v8::V8::initialize();
+            platform
+        })
+    }
+
+    fn eval_js(path: &str, js_expr: &str) -> String {
+        let platform = ensure_v8_initialized().clone();
+        let _guard = V8_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let heap = v8::cppgc::Heap::create(platform, v8::cppgc::HeapCreateParams::default());
+        let isolate = &mut v8::Isolate::new(v8::CreateParams::default().cpp_heap(heap));
+
+        v8::scope!(handle_scope, isolate);
+        let context = v8::Context::new(handle_scope, Default::default());
+        let scope = &mut v8::ContextScope::new(handle_scope, context);
+
+        let object_template_local = create_object_template(scope);
+        let object_template = v8::Global::new(scope, object_template_local);
+
+        let mut reader = bcf::Reader::from_path(path).unwrap();
+        let record = reader.records().next().unwrap().unwrap();
+        let record = Variant::from_record(record);
+
+        let code = v8::String::new(scope, js_expr).unwrap();
+        let script = v8::Script::compile(scope, code, None).unwrap();
+
+        let global = context.global(scope);
+        let variant_name = v8::String::new(scope, "variant").unwrap();
+        let object_template = v8::Local::new(scope, &object_template);
+        let variant_object = create_variant_object(scope, object_template, record);
+        global.set(scope, variant_name.into(), variant_object.into());
+
+        let result = script.run(scope).unwrap();
+        result.to_string(scope).unwrap().to_rust_string_lossy(scope)
+    }
+
+    #[test]
+    fn test_js_info_scalar_and_array() {
+        let path = "tests/t.vcf.gz";
+        assert_eq!(eval_js(path, "variant.info('DP')"), "10");
+        assert_eq!(eval_js(path, "variant.info('NOPE')"), "undefined");
+    }
+
+    #[test]
+    fn test_js_variant_attributes() {
+        let path = "tests/t.vcf.gz";
+        assert_eq!(eval_js(path, "variant.chrom"), "chr1");
+        assert_eq!(eval_js(path, "variant.pos"), "1000");
+        assert_eq!(eval_js(path, "variant.start"), "999");
+        assert_eq!(eval_js(path, "variant.stop"), "1000");
+        assert_eq!(eval_js(path, "variant.ref"), "A");
+        assert_eq!(eval_js(path, "variant.alt.length"), "1");
+        assert_eq!(eval_js(path, "variant.alt[0]"), "C");
+        assert_eq!(eval_js(path, "variant.id"), ".");
+        assert_eq!(eval_js(path, "variant.qual === null"), "true");
+    }
 }
