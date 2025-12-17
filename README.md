@@ -43,6 +43,11 @@ This repository is a small workspace around reading and working with VCF/BCF usi
 
 The npm package expects a compiled native addon to be present as `npm/htsvcf/htsvcf.node`.
 
-- Build the addon (one option): `cargo build -p htsvcf-napi`
+From the repo root:
+
+- Build the addon (release): `cargo build -p htsvcf-napi --release`
 - Copy/rename the produced shared library to `npm/htsvcf/htsvcf.node`
+  - Linux: `cp -f target/release/libhtsvcf_napi.so npm/htsvcf/htsvcf.node`
+  - macOS: `cp -f target/release/libhtsvcf_napi.dylib npm/htsvcf/htsvcf.node`
+- Run the smoke example against the rebuilt addon: `node npm/htsvcf/examples/smoke.mjs`
 - Run JS tests: `npm -C npm/htsvcf test`
