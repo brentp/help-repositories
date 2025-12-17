@@ -11,14 +11,18 @@ const VARIANT_TYPE_NAME: &[u8] = b"Variant\0";
 // internal field so `variant.info()` can always see the latest header.
 const HEADER_INTERNAL_FIELD_INDEX: usize = 1;
 
+/// A single VCF/BCF record exposed to JavaScript.
+///
+/// The embedded `bcf::Record` is kept alive for the duration of evaluation of a
+/// single iteration in [`runner::run_vcf_expr_with`].
 #[derive(Debug)]
 pub struct Variant {
     record: bcf::Record,
     chrom: String,
 }
 
-
 impl Variant {
+    /// Build a `Variant` from a decoded `bcf::Record`.
     pub fn from_record(mut record: bcf::Record) -> Self {
         record.unpack();
         let chrom = match record.rid() {
@@ -33,26 +37,32 @@ impl Variant {
         Self { record, chrom }
     }
 
+    /// Chromosome/contig name.
     pub fn chrom(&self) -> &str {
         &self.chrom
     }
 
+    /// Zero-based start coordinate.
     pub fn start(&self) -> i64 {
         self.record.pos()
     }
 
+    /// One-based POS field.
     pub fn pos(&self) -> i64 {
         self.record.pos() + 1
     }
 
+    /// End coordinate (htslib semantics).
     pub fn end(&self) -> i64 {
         self.record.end()
     }
 
+    /// `ID` field as a string.
     pub fn id(&self) -> String {
         String::from_utf8_lossy(&self.record.id()).into_owned()
     }
 
+    /// Reference allele.
     pub fn reference(&self) -> String {
         self.record
             .alleles()
@@ -61,6 +71,7 @@ impl Variant {
             .unwrap_or_else(|| ".".to_string())
     }
 
+    /// Alternate alleles.
     pub fn alts(&self) -> Vec<String> {
         self.record
             .alleles()
@@ -70,6 +81,7 @@ impl Variant {
             .collect()
     }
 
+    /// QUAL field, or `None` when missing.
     pub fn qual(&self) -> Option<f32> {
         let qual = self.record.qual();
         if qual.is_missing() {
@@ -81,13 +93,18 @@ impl Variant {
 }
 
 unsafe impl v8::cppgc::GarbageCollected for Variant {
+    /// No-op trace because `Variant` does not reference other GC objects.
     fn trace(&self, _visitor: &mut v8::cppgc::Visitor) {}
 
+    /// Class name shown in V8 heap snapshots.
     fn get_name(&self) -> &'static std::ffi::CStr {
         unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(VARIANT_TYPE_NAME) }
     }
 }
 
+/// Create the V8 `ObjectTemplate` used for all `variant` objects.
+///
+/// The template includes accessors for core fields plus an `info(tag)` method.
 pub fn create_object_template<'a>(
     scope: &mut v8::PinScope<'a, '_>,
 ) -> v8::Local<'a, v8::ObjectTemplate> {
@@ -105,9 +122,17 @@ pub fn create_object_template<'a>(
     let info_template = v8::FunctionTemplate::new(scope, info_fn);
     object_template.set(info_key.into(), info_template.into());
 
+    let to_string_key = v8::String::new(scope, "toString").unwrap();
+    let to_string_template = v8::FunctionTemplate::new(scope, to_string_fn);
+    object_template.set(to_string_key.into(), to_string_template.into());
+
     object_template
 }
 
+/// Instantiate a new V8 `variant` object for a particular record.
+///
+/// The `header_obj` is stored in an internal field so `variant.info()` can
+/// resolve tag types/numbers dynamically.
 pub fn create_variant_object<'a>(
     scope: &mut v8::PinScope<'a, '_>,
     object_template: v8::Local<'a, v8::ObjectTemplate>,
@@ -130,6 +155,7 @@ pub fn create_variant_object<'a>(
     object
 }
 
+/// V8 property accessor for the `variant.*` core fields.
 fn attr_getter(
     scope: &mut v8::PinScope<'_, '_>,
     key: v8::Local<v8::Name>,
@@ -184,6 +210,9 @@ fn attr_getter(
     }
 }
 
+/// V8 callback for `variant.info(tag)`.
+///
+/// Uses the JS `header` object to resolve the tag's type and cardinality.
 fn info_fn(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
@@ -217,10 +246,9 @@ fn info_fn(
         return;
     };
 
-    let header_wrapper = unsafe {
-        v8::Object::unwrap::<{ header::HEADER_TAG }, header::Header>(scope, header_obj)
-    }
-    .expect("Failed to unwrap Header");
+    let header_wrapper =
+        unsafe { v8::Object::unwrap::<{ header::HEADER_TAG }, header::Header>(scope, header_obj) }
+            .expect("Failed to unwrap Header");
     let header: &header::Header = unsafe { header_wrapper.as_ref() };
 
     let (tag_type, tag_length) = match header.info_type(tag_bytes) {
@@ -313,6 +341,73 @@ fn info_fn(
     }
 }
 
+/// V8 callback for `variant.toString()`.
+fn to_string_fn(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let this = args.this();
+    let wrapper = unsafe { v8::Object::unwrap::<TAG, Variant>(scope, this) }
+        .expect("Failed to unwrap Variant");
+    let variant = unsafe { wrapper.as_ref() };
+
+    let Some(header_data) = this.get_internal_field(scope, HEADER_INTERNAL_FIELD_INDEX) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    let Ok(header_obj) = v8::Local::<v8::Object>::try_from(header_data) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+
+    let header_wrapper =
+        unsafe { v8::Object::unwrap::<{ header::HEADER_TAG }, header::Header>(scope, header_obj) }
+            .expect("Failed to unwrap Header");
+    let header: &header::Header = unsafe { header_wrapper.as_ref() };
+
+    let mut s = rust_htslib::htslib::kstring_t {
+        l: 0,
+        m: 0,
+        s: std::ptr::null_mut(),
+    };
+
+    // bcf_unpack wants a mutable `bcf1_t*` (it mutates in-place).
+    let record_ptr = variant.record.inner() as *const rust_htslib::htslib::bcf1_t
+        as *mut rust_htslib::htslib::bcf1_t;
+
+    // vcf_format expects an unpacked record.
+    let _ = unsafe {
+        rust_htslib::htslib::bcf_unpack(record_ptr, rust_htslib::htslib::BCF_UN_ALL as i32)
+    };
+
+    let ret = unsafe {
+        rust_htslib::htslib::vcf_format(
+            header.inner_ptr() as *const rust_htslib::htslib::bcf_hdr_t,
+            record_ptr as *const rust_htslib::htslib::bcf1_t,
+            &mut s,
+        )
+    };
+    if ret != 0 {
+        if !s.s.is_null() {
+            unsafe { rust_htslib::htslib::free(s.s as *mut std::os::raw::c_void) };
+        }
+        rv.set(v8::undefined(scope).into());
+        return;
+    }
+
+    let bytes = unsafe { std::slice::from_raw_parts(s.s as *const u8, s.l as usize) };
+    let text = String::from_utf8_lossy(bytes).into_owned();
+
+    if !s.s.is_null() {
+        unsafe { rust_htslib::htslib::free(s.s as *mut std::os::raw::c_void) };
+    }
+
+    let out = v8::String::new(scope, text.trim_end_matches('\n')).unwrap();
+    rv.set(out.into());
+}
+
+/// Read an INFO/Flag tag from a record.
 fn header_info_flag(header: &header::Header, record: &bcf::Record, tag: &[u8]) -> Result<bool, ()> {
     let Ok(c_str) = CString::new(tag) else {
         return Err(());
@@ -321,7 +416,8 @@ fn header_info_flag(header: &header::Header, record: &bcf::Record, tag: &[u8]) -
     // bcf_get_info_values wants a mutable bcf1_t*, but does not mutate the record.
     // rust-htslib does not expose a mutable pointer from an immutable borrow, so
     // we cast here.
-    let record_ptr = record.inner() as *const rust_htslib::htslib::bcf1_t as *mut rust_htslib::htslib::bcf1_t;
+    let record_ptr =
+        record.inner() as *const rust_htslib::htslib::bcf1_t as *mut rust_htslib::htslib::bcf1_t;
 
     let mut dst: *mut std::os::raw::c_void = std::ptr::null_mut();
     let mut ndst: i32 = 0;
@@ -348,32 +444,25 @@ fn header_info_flag(header: &header::Header, record: &bcf::Record, tag: &[u8]) -
     }
 }
 
+/// Read an INFO/Integer tag as i32 values.
 fn header_info_values_i32(
     header: &header::Header,
     record: &bcf::Record,
     tag: &[u8],
 ) -> Result<Option<Vec<i32>>, ()> {
-    header_info_values_numeric::<i32>(
-        header,
-        record,
-        tag,
-        rust_htslib::htslib::BCF_HT_INT as i32,
-    )
+    header_info_values_numeric::<i32>(header, record, tag, rust_htslib::htslib::BCF_HT_INT as i32)
 }
 
+/// Read an INFO/Float tag as f32 values.
 fn header_info_values_f32(
     header: &header::Header,
     record: &bcf::Record,
     tag: &[u8],
 ) -> Result<Option<Vec<f32>>, ()> {
-    header_info_values_numeric::<f32>(
-        header,
-        record,
-        tag,
-        rust_htslib::htslib::BCF_HT_REAL as i32,
-    )
+    header_info_values_numeric::<f32>(header, record, tag, rust_htslib::htslib::BCF_HT_REAL as i32)
 }
 
+/// Shared implementation for numeric INFO values.
 fn header_info_values_numeric<T: Copy + Numeric>(
     header: &header::Header,
     record: &bcf::Record,
@@ -384,7 +473,8 @@ fn header_info_values_numeric<T: Copy + Numeric>(
         return Err(());
     };
 
-    let record_ptr = record.inner() as *const rust_htslib::htslib::bcf1_t as *mut rust_htslib::htslib::bcf1_t;
+    let record_ptr =
+        record.inner() as *const rust_htslib::htslib::bcf1_t as *mut rust_htslib::htslib::bcf1_t;
 
     let mut dst: *mut std::os::raw::c_void = std::ptr::null_mut();
     let mut ndst: i32 = 0;
@@ -425,6 +515,7 @@ fn header_info_values_numeric<T: Copy + Numeric>(
     }
 }
 
+/// Read an INFO/String tag as a list of byte strings.
 fn header_info_values_string(
     header: &header::Header,
     record: &bcf::Record,
@@ -434,7 +525,8 @@ fn header_info_values_string(
         return Err(());
     };
 
-    let record_ptr = record.inner() as *const rust_htslib::htslib::bcf1_t as *mut rust_htslib::htslib::bcf1_t;
+    let record_ptr =
+        record.inner() as *const rust_htslib::htslib::bcf1_t as *mut rust_htslib::htslib::bcf1_t;
 
     let mut dst: *mut std::os::raw::c_void = std::ptr::null_mut();
     let mut ndst: i32 = 0;
@@ -463,10 +555,7 @@ fn header_info_values_string(
             let mut out = Vec::new();
             for part in bytes.split(|c| *c == b',') {
                 // stop at zero character
-                let part = part
-                    .split(|c| *c == 0u8)
-                    .next()
-                    .ok_or(())?;
+                let part = part.split(|c| *c == 0u8).next().ok_or(())?;
                 out.push(part.to_vec());
             }
             if !dst.is_null() {
@@ -483,6 +572,7 @@ fn header_info_values_string(
     }
 }
 
+/// Convert scalar/array numeric INFO values into a V8 value.
 fn info_numeric_to_value<'s, 'i, T: Numeric + Copy>(
     scope: &mut v8::PinScope<'s, 'i>,
     values: &[T],
@@ -521,6 +611,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    /// Evaluate JS against the first record and return stringified result.
     fn eval_js(path: &str, js_expr: &str) -> String {
         let platform = crate::runtime::ensure_v8_initialized().clone();
         let _guard = crate::runtime::v8_lock();
@@ -565,6 +656,7 @@ mod tests {
         result.to_string(scope).unwrap().to_rust_string_lossy(scope)
     }
 
+    /// Create a unique temp path for tests.
     fn tmp_path(file_name: &str) -> PathBuf {
         // Keep temp files isolated per-test.
         let mut path = std::env::temp_dir();
@@ -581,6 +673,7 @@ mod tests {
     }
 
     #[test]
+    /// Validate basic Rust-side `Variant` accessors.
     fn test_variant_basic_fields() {
         let mut reader = bcf::Reader::from_path("tests/t.vcf.gz").unwrap();
         let record = reader.records().next().unwrap().unwrap();
@@ -596,6 +689,7 @@ mod tests {
     }
 
     #[test]
+    /// `variant.info()` should return scalar values where appropriate.
     fn test_js_info_scalar_and_array() {
         let path = "tests/t.vcf.gz";
         assert_eq!(eval_js(path, "variant.info('DP')"), "10");
@@ -603,6 +697,7 @@ mod tests {
     }
 
     #[test]
+    /// V8 accessors expose core VCF fields.
     fn test_js_variant_attributes() {
         let path = "tests/t.vcf.gz";
         assert_eq!(eval_js(path, "variant.chrom"), "chr1");
@@ -617,17 +712,18 @@ mod tests {
     }
 
     #[test]
+    /// `variant.info()` uses header type/number semantics.
     fn test_variant_info_uses_header_type_and_number() {
         let path = tmp_path("info.vcf");
         let vcf = "##fileformat=VCFv4.2\n\
- ##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n\
- ##INFO=<ID=AF,Number=2,Type=Float,Description=\"Allele frequencies\">\n\
- ##INFO=<ID=NOTE,Number=1,Type=String,Description=\"Note\">\n\
- ##INFO=<ID=FLAGS,Number=.,Type=String,Description=\"Flags\">\n\
- ##INFO=<ID=SOMATIC,Number=0,Type=Flag,Description=\"Somatic\">\n\
- ##contig=<ID=chr1>\n\
- #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
- chr1\t1\t.\tA\tC,G\t.\t.\tDP=7;AF=0.1,0.2;NOTE=hi;FLAGS=a,b,c;SOMATIC\n";
+  ##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n\
+  ##INFO=<ID=AF,Number=2,Type=Float,Description=\"Allele frequencies\">\n\
+  ##INFO=<ID=NOTE,Number=1,Type=String,Description=\"Note\">\n\
+  ##INFO=<ID=FLAGS,Number=.,Type=String,Description=\"Flags\">\n\
+  ##INFO=<ID=SOMATIC,Number=0,Type=Flag,Description=\"Somatic\">\n\
+  ##contig=<ID=chr1>\n\
+  #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+  chr1\t1\t.\tA\tC,G\t.\t.\tDP=7;AF=0.1,0.2;NOTE=hi;FLAGS=a,b,c;SOMATIC\n";
         fs::write(&path, vcf).unwrap();
         let path = path.to_str().unwrap();
 
@@ -649,5 +745,23 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    /// `variant.toString()` should return the formatted VCF line.
+    fn test_variant_to_string() {
+        let path = "tests/t.vcf.gz";
 
+        assert_eq!(
+            eval_js(path, "variant.toString().startsWith('chr1\\t1000')"),
+            "true"
+        );
+        assert_eq!(
+            eval_js(path, "variant.toString().includes('\\tA\\tC')"),
+            "true"
+        );
+        assert_eq!(
+            eval_js(path, "variant.toString().includes('DP=10')"),
+            "true"
+        );
+        assert_eq!(eval_js(path, "variant.toString().endsWith('\\n')"), "false");
+    }
 }

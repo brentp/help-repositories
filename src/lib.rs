@@ -4,8 +4,8 @@
 //! records in a VCF/BCF and evaluates a JavaScript expression for each record.
 
 pub mod header;
-pub mod runtime;
 pub mod runner;
+pub mod runtime;
 pub mod variant;
 
 pub use header::Header;

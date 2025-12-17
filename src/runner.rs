@@ -17,6 +17,7 @@ pub struct RunOptions {
 }
 
 impl Default for RunOptions {
+    /// Create default run options.
     fn default() -> Self {
         Self {
             gc_every: Some(DEFAULT_GC_EVERY),
@@ -24,6 +25,9 @@ impl Default for RunOptions {
     }
 }
 
+/// Force a full V8 + cppgc collection.
+///
+/// This uses V8's testing APIs and is intended for steady-state benchmarking.
 fn maybe_force_gc(scope: &mut v8::PinScope<'_, '_>) {
     scope.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
     unsafe {
@@ -34,6 +38,9 @@ fn maybe_force_gc(scope: &mut v8::PinScope<'_, '_>) {
     }
 }
 
+/// Evaluate a JavaScript expression once per VCF/BCF record.
+///
+/// The callback receives the stringified JS result for each record.
 pub fn run_vcf_expr_with<F>(
     path: &str,
     js_expr: &str,
@@ -84,7 +91,9 @@ where
         global.set(loop_scope, variant_name.into(), variant_object.into());
 
         let result = script.run(loop_scope).expect("script run failed");
-        let result_str = result.to_string(loop_scope).expect("result to_string failed");
+        let result_str = result
+            .to_string(loop_scope)
+            .expect("result to_string failed");
         on_result(result_str.to_rust_string_lossy(loop_scope))?;
 
         if let Some(gc_every) = opts.gc_every {
@@ -97,6 +106,7 @@ where
     Ok(())
 }
 
+/// Convenience wrapper that prints each expression result to stdout.
 pub fn run_vcf_expr_to_stdout(path: &str, js_expr: &str, opts: RunOptions) -> Result<(), AnyError> {
     run_vcf_expr_with(path, js_expr, opts, |line| {
         println!("{line}");

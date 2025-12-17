@@ -1,5 +1,8 @@
 type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
+/// CLI entrypoint.
+///
+/// Usage: `v8_hts <input.vcf|input.bcf> [js_expr]`.
 fn main() -> Result<(), AnyError> {
     let mut args = std::env::args();
     let program = args.next().unwrap_or_else(|| "v8_hts".to_string());
