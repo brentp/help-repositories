@@ -1,15 +1,22 @@
+use crate::header;
 use rust_htslib::bcf;
 use rust_htslib::bcf::header::{TagLength, TagType};
 use rust_htslib::bcf::record::Numeric;
+use std::ffi::CString;
 
 pub const TAG: u16 = 1;
 const VARIANT_TYPE_NAME: &[u8] = b"Variant\0";
+
+// Variant instances store a reference to the JS `header` object in an
+// internal field so `variant.info()` can always see the latest header.
+const HEADER_INTERNAL_FIELD_INDEX: usize = 1;
 
 #[derive(Debug)]
 pub struct Variant {
     record: bcf::Record,
     chrom: String,
 }
+
 
 impl Variant {
     pub fn from_record(mut record: bcf::Record) -> Self {
@@ -85,7 +92,9 @@ pub fn create_object_template<'a>(
     scope: &mut v8::PinScope<'a, '_>,
 ) -> v8::Local<'a, v8::ObjectTemplate> {
     let object_template = v8::ObjectTemplate::new(scope);
-    object_template.set_internal_field_count(1);
+    // internal field 0: wrapped `Variant`
+    // internal field 1: JS `header` object
+    object_template.set_internal_field_count(2);
 
     for key in ["start", "pos", "stop", "chrom", "id", "ref", "alt", "qual"] {
         let name = v8::String::new(scope, key).unwrap();
@@ -103,6 +112,7 @@ pub fn create_variant_object<'a>(
     scope: &mut v8::PinScope<'a, '_>,
     object_template: v8::Local<'a, v8::ObjectTemplate>,
     variant: Variant,
+    header_obj: v8::Local<'a, v8::Object>,
 ) -> v8::Local<'a, v8::Object> {
     let object = object_template
         .new_instance(scope)
@@ -113,6 +123,9 @@ pub fn create_variant_object<'a>(
     unsafe {
         v8::Object::wrap::<TAG, Variant>(scope, object, &wrapper);
     }
+
+    // Store the JS header object directly so it remains GC-traced.
+    object.set_internal_field(HEADER_INTERNAL_FIELD_INDEX, header_obj.into());
 
     object
 }
@@ -194,23 +207,52 @@ fn info_fn(
     let tag = tag_str.to_rust_string_lossy(scope);
     let tag_bytes = tag.as_bytes();
 
-    let (tag_type, tag_length) = match variant.record.header().info_type(tag_bytes) {
-        Ok(v) => v,
-        Err(_) => {
+    let Some(header_data) = this.get_internal_field(scope, HEADER_INTERNAL_FIELD_INDEX) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+
+    let Ok(header_obj) = v8::Local::<v8::Object>::try_from(header_data) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+
+    let header_wrapper = unsafe {
+        v8::Object::unwrap::<{ header::HEADER_TAG }, header::Header>(scope, header_obj)
+    }
+    .expect("Failed to unwrap Header");
+    let header: &header::Header = unsafe { header_wrapper.as_ref() };
+
+    let (tag_type, tag_length) = match header.info_type(tag_bytes) {
+        Some(v) => v,
+        None => {
             rv.set(v8::undefined(scope).into());
             return;
         }
     };
 
     match tag_type {
-        TagType::Flag => match variant.record.info(tag_bytes).flag() {
-            Ok(v) => rv.set(v8::Boolean::new(scope, v).into()),
-            Err(_) => rv.set(v8::undefined(scope).into()),
-        },
+        TagType::Flag => {
+            let is_set = match header_info_flag(header, &variant.record, tag_bytes) {
+                Ok(v) => v,
+                Err(_) => {
+                    rv.set(v8::undefined(scope).into());
+                    return;
+                }
+            };
+            rv.set(v8::Boolean::new(scope, is_set).into());
+        }
         TagType::Integer => {
-            let Ok(Some(values)) = variant.record.info(tag_bytes).integer() else {
-                rv.set(v8::undefined(scope).into());
-                return;
+            let values = match header_info_values_i32(header, &variant.record, tag_bytes) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    rv.set(v8::undefined(scope).into());
+                    return;
+                }
+                Err(_) => {
+                    rv.set(v8::undefined(scope).into());
+                    return;
+                }
             };
 
             info_numeric_to_value(scope, &values, tag_length, &mut rv, |scope, v| {
@@ -218,9 +260,16 @@ fn info_fn(
             });
         }
         TagType::Float => {
-            let Ok(Some(values)) = variant.record.info(tag_bytes).float() else {
-                rv.set(v8::undefined(scope).into());
-                return;
+            let values = match header_info_values_f32(header, &variant.record, tag_bytes) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    rv.set(v8::undefined(scope).into());
+                    return;
+                }
+                Err(_) => {
+                    rv.set(v8::undefined(scope).into());
+                    return;
+                }
             };
 
             info_numeric_to_value(scope, &values, tag_length, &mut rv, |scope, v| {
@@ -228,9 +277,16 @@ fn info_fn(
             });
         }
         TagType::String => {
-            let Ok(Some(values)) = variant.record.info(tag_bytes).string() else {
-                rv.set(v8::undefined(scope).into());
-                return;
+            let values = match header_info_values_string(header, &variant.record, tag_bytes) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    rv.set(v8::undefined(scope).into());
+                    return;
+                }
+                Err(_) => {
+                    rv.set(v8::undefined(scope).into());
+                    return;
+                }
             };
 
             match tag_length {
@@ -253,6 +309,176 @@ fn info_fn(
                     rv.set(arr.into());
                 }
             }
+        }
+    }
+}
+
+fn header_info_flag(header: &header::Header, record: &bcf::Record, tag: &[u8]) -> Result<bool, ()> {
+    let Ok(c_str) = CString::new(tag) else {
+        return Err(());
+    };
+
+    // bcf_get_info_values wants a mutable bcf1_t*, but does not mutate the record.
+    // rust-htslib does not expose a mutable pointer from an immutable borrow, so
+    // we cast here.
+    let record_ptr = record.inner() as *const rust_htslib::htslib::bcf1_t as *mut rust_htslib::htslib::bcf1_t;
+
+    let mut dst: *mut std::os::raw::c_void = std::ptr::null_mut();
+    let mut ndst: i32 = 0;
+
+    let ret = unsafe {
+        rust_htslib::htslib::bcf_get_info_values(
+            header.inner_ptr(),
+            record_ptr,
+            c_str.as_ptr() as *mut std::os::raw::c_char,
+            &mut dst,
+            &mut ndst,
+            rust_htslib::htslib::BCF_HT_FLAG as i32,
+        )
+    };
+
+    if !dst.is_null() {
+        unsafe { rust_htslib::htslib::free(dst) };
+    }
+
+    match ret {
+        -3 => Ok(false),
+        1 => Ok(true),
+        _ => Err(()),
+    }
+}
+
+fn header_info_values_i32(
+    header: &header::Header,
+    record: &bcf::Record,
+    tag: &[u8],
+) -> Result<Option<Vec<i32>>, ()> {
+    header_info_values_numeric::<i32>(
+        header,
+        record,
+        tag,
+        rust_htslib::htslib::BCF_HT_INT as i32,
+    )
+}
+
+fn header_info_values_f32(
+    header: &header::Header,
+    record: &bcf::Record,
+    tag: &[u8],
+) -> Result<Option<Vec<f32>>, ()> {
+    header_info_values_numeric::<f32>(
+        header,
+        record,
+        tag,
+        rust_htslib::htslib::BCF_HT_REAL as i32,
+    )
+}
+
+fn header_info_values_numeric<T: Copy + Numeric>(
+    header: &header::Header,
+    record: &bcf::Record,
+    tag: &[u8],
+    data_type: i32,
+) -> Result<Option<Vec<T>>, ()> {
+    let Ok(c_str) = CString::new(tag) else {
+        return Err(());
+    };
+
+    let record_ptr = record.inner() as *const rust_htslib::htslib::bcf1_t as *mut rust_htslib::htslib::bcf1_t;
+
+    let mut dst: *mut std::os::raw::c_void = std::ptr::null_mut();
+    let mut ndst: i32 = 0;
+
+    let ret = unsafe {
+        rust_htslib::htslib::bcf_get_info_values(
+            header.inner_ptr(),
+            record_ptr,
+            c_str.as_ptr() as *mut std::os::raw::c_char,
+            &mut dst,
+            &mut ndst,
+            data_type,
+        )
+    };
+
+    match ret {
+        -3 => Ok(None),
+        0 => {
+            if !dst.is_null() {
+                unsafe { rust_htslib::htslib::free(dst) };
+            }
+            Ok(Some(Vec::new()))
+        }
+        ret if ret > 0 => {
+            let slice = unsafe { std::slice::from_raw_parts(dst as *const T, ret as usize) };
+            let vec = slice.to_vec();
+            if !dst.is_null() {
+                unsafe { rust_htslib::htslib::free(dst) };
+            }
+            Ok(Some(vec))
+        }
+        _ => {
+            if !dst.is_null() {
+                unsafe { rust_htslib::htslib::free(dst) };
+            }
+            Err(())
+        }
+    }
+}
+
+fn header_info_values_string(
+    header: &header::Header,
+    record: &bcf::Record,
+    tag: &[u8],
+) -> Result<Option<Vec<Vec<u8>>>, ()> {
+    let Ok(c_str) = CString::new(tag) else {
+        return Err(());
+    };
+
+    let record_ptr = record.inner() as *const rust_htslib::htslib::bcf1_t as *mut rust_htslib::htslib::bcf1_t;
+
+    let mut dst: *mut std::os::raw::c_void = std::ptr::null_mut();
+    let mut ndst: i32 = 0;
+
+    let ret = unsafe {
+        rust_htslib::htslib::bcf_get_info_values(
+            header.inner_ptr(),
+            record_ptr,
+            c_str.as_ptr() as *mut std::os::raw::c_char,
+            &mut dst,
+            &mut ndst,
+            rust_htslib::htslib::BCF_HT_STR as i32,
+        )
+    };
+
+    match ret {
+        -3 => Ok(None),
+        0 => {
+            if !dst.is_null() {
+                unsafe { rust_htslib::htslib::free(dst) };
+            }
+            Ok(Some(Vec::new()))
+        }
+        ret if ret > 0 => {
+            let bytes = unsafe { std::slice::from_raw_parts(dst as *const u8, ret as usize) };
+            let mut out = Vec::new();
+            for part in bytes.split(|c| *c == b',') {
+                // stop at zero character
+                let part = part
+                    .split(|c| *c == 0u8)
+                    .next()
+                    .ok_or(())?;
+                out.push(part.to_vec());
+            }
+            if !dst.is_null() {
+                unsafe { rust_htslib::htslib::free(dst) };
+            }
+            Ok(Some(out))
+        }
+        _ => {
+            if !dst.is_null() {
+                unsafe { rust_htslib::htslib::free(dst) };
+            }
+            Err(())
         }
     }
 }
@@ -294,27 +520,10 @@ mod tests {
     use rust_htslib::bcf::Read;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
-
-    const V8_FLAGS: &str = "--no_freeze_flags_after_init --expose-gc";
-
-    static V8_LOCK: Mutex<()> = Mutex::new(());
-    static PLATFORM: OnceLock<v8::SharedRef<v8::Platform>> = OnceLock::new();
-
-    fn ensure_v8_initialized() -> &'static v8::SharedRef<v8::Platform> {
-        PLATFORM.get_or_init(|| {
-            let platform = v8::new_unprotected_default_platform(0, false).make_shared();
-            v8::V8::set_flags_from_string(V8_FLAGS);
-            v8::V8::initialize_platform(platform.clone());
-            v8::cppgc::initialize_process(platform.clone());
-            v8::V8::initialize();
-            platform
-        })
-    }
 
     fn eval_js(path: &str, js_expr: &str) -> String {
-        let platform = ensure_v8_initialized().clone();
-        let _guard = V8_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let platform = crate::testutil::ensure_v8_initialized().clone();
+        let _guard = crate::testutil::v8_lock();
 
         let heap = v8::cppgc::Heap::create(platform, v8::cppgc::HeapCreateParams::default());
         let isolate = &mut v8::Isolate::new(v8::CreateParams::default().cpp_heap(heap));
@@ -330,13 +539,26 @@ mod tests {
         let record = reader.records().next().unwrap().unwrap();
         let record = Variant::from_record(record);
 
+        let header_obj = crate::header::create_header_object(
+            scope,
+            crate::header::Header::new(reader.header().inner),
+        );
+
         let code = v8::String::new(scope, js_expr).unwrap();
         let script = v8::Script::compile(scope, code, None).unwrap();
 
         let global = context.global(scope);
+
+        let header_name = v8::String::new(scope, "header").unwrap();
+        global.set(scope, header_name.into(), header_obj.into());
+        let header_obj = global
+            .get(scope, header_name.into())
+            .and_then(|v| v8::Local::<v8::Object>::try_from(v).ok())
+            .expect("header object missing");
+
         let variant_name = v8::String::new(scope, "variant").unwrap();
         let object_template = v8::Local::new(scope, &object_template);
-        let variant_object = create_variant_object(scope, object_template, record);
+        let variant_object = create_variant_object(scope, object_template, record, header_obj);
         global.set(scope, variant_name.into(), variant_object.into());
 
         let result = script.run(scope).unwrap();
@@ -344,6 +566,7 @@ mod tests {
     }
 
     fn tmp_path(file_name: &str) -> PathBuf {
+        // Keep temp files isolated per-test.
         let mut path = std::env::temp_dir();
         path.push(format!(
             "v8_hts_{}_{}_{}",
@@ -397,14 +620,14 @@ mod tests {
     fn test_variant_info_uses_header_type_and_number() {
         let path = tmp_path("info.vcf");
         let vcf = "##fileformat=VCFv4.2\n\
-##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n\
-##INFO=<ID=AF,Number=2,Type=Float,Description=\"Allele frequencies\">\n\
-##INFO=<ID=NOTE,Number=1,Type=String,Description=\"Note\">\n\
-##INFO=<ID=FLAGS,Number=.,Type=String,Description=\"Flags\">\n\
-##INFO=<ID=SOMATIC,Number=0,Type=Flag,Description=\"Somatic\">\n\
-##contig=<ID=chr1>\n\
-#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
-chr1\t1\t.\tA\tC,G\t.\t.\tDP=7;AF=0.1,0.2;NOTE=hi;FLAGS=a,b,c;SOMATIC\n";
+ ##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n\
+ ##INFO=<ID=AF,Number=2,Type=Float,Description=\"Allele frequencies\">\n\
+ ##INFO=<ID=NOTE,Number=1,Type=String,Description=\"Note\">\n\
+ ##INFO=<ID=FLAGS,Number=.,Type=String,Description=\"Flags\">\n\
+ ##INFO=<ID=SOMATIC,Number=0,Type=Flag,Description=\"Somatic\">\n\
+ ##contig=<ID=chr1>\n\
+ #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
+ chr1\t1\t.\tA\tC,G\t.\t.\tDP=7;AF=0.1,0.2;NOTE=hi;FLAGS=a,b,c;SOMATIC\n";
         fs::write(&path, vcf).unwrap();
         let path = path.to_str().unwrap();
 
@@ -425,4 +648,6 @@ chr1\t1\t.\tA\tC,G\t.\t.\tDP=7;AF=0.1,0.2;NOTE=hi;FLAGS=a,b,c;SOMATIC\n";
 
         let _ = fs::remove_file(path);
     }
+
+
 }

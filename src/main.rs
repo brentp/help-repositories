@@ -1,7 +1,10 @@
 use rust_htslib::bcf::{self, Read};
 
+mod header;
+mod testutil;
 mod variant;
 
+use header::{create_header_object, Header};
 use variant::{create_object_template, create_variant_object, Variant};
 
 type AnyError = Box<dyn std::error::Error>;
@@ -41,9 +44,18 @@ fn run(path: &str, js_expr: &str) -> Result<(), AnyError> {
 
         let mut reader = bcf::Reader::from_path(path)?;
 
+        let header_obj = create_header_object(scope, Header::new(reader.header().inner));
+        let global = context.global(scope);
+        let header_name = v8::String::new(scope, "header").unwrap();
+        global.set(scope, header_name.into(), header_obj.into());
+
+        let header_obj = global
+            .get(scope, header_name.into())
+            .and_then(|v| v8::Local::<v8::Object>::try_from(v).ok())
+            .expect("header object missing");
+
         let code = v8::String::new(scope, js_expr).unwrap();
         let script = v8::Script::compile(scope, code, None).unwrap();
-        let global = context.global(scope);
         let variant_name = v8::String::new(scope, "variant").unwrap();
 
         for (i, result) in reader.records().enumerate() {
@@ -54,7 +66,7 @@ fn run(path: &str, js_expr: &str) -> Result<(), AnyError> {
             v8::scope!(loop_scope, scope);
             let object_template = v8::Local::new(loop_scope, &object_template);
 
-            let variant_object = create_variant_object(loop_scope, object_template, record);
+            let variant_object = create_variant_object(loop_scope, object_template, record, header_obj);
             global.set(loop_scope, variant_name.into(), variant_object.into());
 
             let result = script.run(loop_scope).unwrap();
