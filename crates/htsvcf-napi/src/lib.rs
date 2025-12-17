@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use htsvcf_core as core;
 use napi::bindgen_prelude::*;
-use napi::{sys, Env, JsObject, NapiRaw};
+use napi::{sys, Env};
 use napi_derive::napi;
 
 #[napi(object)]
@@ -165,7 +165,7 @@ pub struct NextTask {
 
 impl Task for NextTask {
   type Output = Option<core::Variant>;
-  type JsValue = JsObject;
+  type JsValue = Object<'static>;
 
   fn compute(&mut self) -> napi::Result<Self::Output> {
     let mut guard = self
@@ -184,7 +184,7 @@ impl Task for NextTask {
   }
 
   fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
-    let mut out = env.create_object()?;
+    let mut out: Object<'static> = Object::new(&env)?;
 
     match output {
       None => {
@@ -373,17 +373,17 @@ impl Header {
       TagLength::Variable => ".".to_string(),
     };
 
-    let mut out = env.create_object()?;
+    let mut out = Object::new(&env)?;
     out.set_named_property("id", id)?;
     out.set_named_property("type", type_str)?;
     out.set_named_property("number", number)?;
     out.set_named_property("description", description.unwrap_or_default())?;
 
-    Ok(unsafe { out.raw() })
+    Ok(out.raw())
   }
 
   #[napi]
-  pub fn records(&self, env: Env) -> napi::Result<Vec<JsObject>> {
+  pub fn records(&self, env: Env) -> napi::Result<Vec<Object<'static>>> {
     use rust_htslib::bcf::header::HeaderRecord;
 
     let mut out = Vec::new();
@@ -404,8 +404,8 @@ impl Header {
         HeaderRecord::Structured { key, values } => {
           out.push(record_kv(env, "structured", key, values)?);
         }
-        HeaderRecord::Generic { key, value } => {
-          let mut o = env.create_object()?;
+         HeaderRecord::Generic { key, value } => {
+          let mut o: Object<'static> = Object::new(&env)?;
           o.set_named_property("type", "generic")?;
           o.set_named_property("key", key)?;
           o.set_named_property("value", value)?;
@@ -441,8 +441,8 @@ fn record_kv(
   record_type: &str,
   key: String,
   values: impl IntoIterator<Item = (String, String)>,
-) -> napi::Result<JsObject> {
-  let mut o = env.create_object()?;
+) -> napi::Result<Object<'static>> {
+  let mut o: Object<'static> = Object::new(&env)?;
   o.set_named_property("type", record_type)?;
   o.set_named_property("key", key)?;
   for (k, v) in values.into_iter() {
@@ -460,12 +460,12 @@ fn infovalue_to_napi_value(env: &Env, v: &core::InfoValue) -> napi::Result<sys::
     core::InfoValue::Float(f) => unsafe { ToNapiValue::to_napi_value(env.raw(), env.create_double(*f as f64)?) },
     core::InfoValue::String(s) => unsafe { ToNapiValue::to_napi_value(env.raw(), env.create_string(s)?) },
     core::InfoValue::Array(values) => {
-      let mut arr = env.create_array_with_length(values.len())?;
-      for (i, item) in values.iter().enumerate() {
-        let item_value = infovalue_to_napi_value(env, item)?;
-        arr.set_element(i as u32, item_value)?;
-      }
-      Ok(unsafe { arr.raw() })
+      let inner_values = values
+        .iter()
+        .map(|item| infovalue_to_napi_value(env, item))
+        .collect::<napi::Result<Vec<sys::napi_value>>>()?;
+      let arr = Array::from_vec(env, inner_values)?;
+      Ok(arr.raw())
     }
   }
 }
