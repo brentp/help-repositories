@@ -410,6 +410,14 @@ pub fn create_reader_constructor<'a>(
 mod tests {
     use super::*;
     use rust_htslib::bcf::Read;
+    use std::path::PathBuf;
+
+    fn fixture_vcf() -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/t.vcf.gz")
+            .to_string_lossy()
+            .into_owned()
+    }
 
     fn eval_js(js_expr: &str) -> String {
         let platform = crate::runtime::ensure_v8_initialized().clone();
@@ -435,25 +443,35 @@ mod tests {
 
     #[test]
     fn test_reader_iterates_all_records() {
-        let mut rust_reader = bcf::Reader::from_path("tests/t.vcf.gz").unwrap();
+        let path = fixture_vcf();
+        let mut rust_reader = bcf::Reader::from_path(&path).unwrap();
         let expected = rust_reader.records().count();
 
         let js = format!(
-            "(() => {{ const r = new Reader('tests/t.vcf.gz'); let n = 0; for (const v of r) {{ n += 1; }} return n; }})()"
+            "(() => {{ const r = new Reader('{}'); let n = 0; for (const v of r) {{ n += 1; }} return n; }})()",
+            path.replace('\\', "\\\\")
         );
         assert_eq!(eval_js(&js), expected.to_string());
     }
 
     #[test]
     fn test_reader_query_region_string() {
+        let path = fixture_vcf().replace('\\', "\\\\");
         // The test VCF has first record at chr1:1000 (1-based).
-        let js = "(() => { const r = new Reader('tests/t.vcf.gz'); if (!r.hasIndex()) return 'noindex'; r.query('chr1:1000-1000'); let n = 0; for (const v of r) n++; return n; })()";
-        assert_eq!(eval_js(js), "1");
+        let js = format!(
+            "(() => {{ const r = new Reader('{}'); if (!r.hasIndex()) return 'noindex'; r.query('chr1:1000-1000'); let n = 0; for (const v of r) n++; return n; }})()",
+            path
+        );
+        assert_eq!(eval_js(&js), "1");
     }
 
     #[test]
     fn test_reader_query_numeric_0based() {
-        let js = "(() => { const r = new Reader('tests/t.vcf.gz'); if (!r.hasIndex()) return 'noindex'; r.query('chr1', 999, 999); let n = 0; for (const v of r) n++; return n; })()";
-        assert_eq!(eval_js(js), "1");
+        let path = fixture_vcf().replace('\\', "\\\\");
+        let js = format!(
+            "(() => {{ const r = new Reader('{}'); if (!r.hasIndex()) return 'noindex'; r.query('chr1', 999, 999); let n = 0; for (const v of r) n++; return n; }})()",
+            path
+        );
+        assert_eq!(eval_js(&js), "1");
     }
 }

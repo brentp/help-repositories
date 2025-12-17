@@ -611,6 +611,13 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    fn fixture_vcf() -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/t.vcf.gz")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// Evaluate JS against the first record and return stringified result.
     fn eval_js(path: &str, js_expr: &str) -> String {
         let platform = crate::runtime::ensure_v8_initialized().clone();
@@ -675,7 +682,8 @@ mod tests {
     #[test]
     /// Validate basic Rust-side `Variant` accessors.
     fn test_variant_basic_fields() {
-        let mut reader = bcf::Reader::from_path("tests/t.vcf.gz").unwrap();
+        let path = fixture_vcf();
+        let mut reader = bcf::Reader::from_path(&path).unwrap();
         let record = reader.records().next().unwrap().unwrap();
         let variant = Variant::from_record(record);
 
@@ -691,24 +699,24 @@ mod tests {
     #[test]
     /// `variant.info()` should return scalar values where appropriate.
     fn test_js_info_scalar_and_array() {
-        let path = "tests/t.vcf.gz";
-        assert_eq!(eval_js(path, "variant.info('DP')"), "10");
-        assert_eq!(eval_js(path, "variant.info('NOPE')"), "undefined");
+        let path = fixture_vcf();
+        assert_eq!(eval_js(&path, "variant.info('DP')"), "10");
+        assert_eq!(eval_js(&path, "variant.info('NOPE')"), "undefined");
     }
 
     #[test]
     /// V8 accessors expose core VCF fields.
     fn test_js_variant_attributes() {
-        let path = "tests/t.vcf.gz";
-        assert_eq!(eval_js(path, "variant.chrom"), "chr1");
-        assert_eq!(eval_js(path, "variant.pos"), "1000");
-        assert_eq!(eval_js(path, "variant.start"), "999");
-        assert_eq!(eval_js(path, "variant.stop"), "1000");
-        assert_eq!(eval_js(path, "variant.ref"), "A");
-        assert_eq!(eval_js(path, "variant.alt.length"), "1");
-        assert_eq!(eval_js(path, "variant.alt[0]"), "C");
-        assert_eq!(eval_js(path, "variant.id"), ".");
-        assert_eq!(eval_js(path, "variant.qual === null"), "true");
+        let path = fixture_vcf();
+        assert_eq!(eval_js(&path, "variant.chrom"), "chr1");
+        assert_eq!(eval_js(&path, "variant.pos"), "1000");
+        assert_eq!(eval_js(&path, "variant.start"), "999");
+        assert_eq!(eval_js(&path, "variant.stop"), "1000");
+        assert_eq!(eval_js(&path, "variant.ref"), "A");
+        assert_eq!(eval_js(&path, "variant.alt.length"), "1");
+        assert_eq!(eval_js(&path, "variant.alt[0]"), "C");
+        assert_eq!(eval_js(&path, "variant.id"), ".");
+        assert_eq!(eval_js(&path, "variant.qual === null"), "true");
     }
 
     #[test]
@@ -748,20 +756,23 @@ mod tests {
     #[test]
     /// `variant.toString()` should return the formatted VCF line.
     fn test_variant_to_string() {
-        let path = "tests/t.vcf.gz";
+        let path = fixture_vcf();
 
         assert_eq!(
-            eval_js(path, "variant.toString().startsWith('chr1\\t1000')"),
+            eval_js(&path, "variant.toString().startsWith('chr1\\t1000')"),
             "true"
         );
         assert_eq!(
-            eval_js(path, "variant.toString().includes('\\tA\\tC')"),
+            eval_js(&path, "variant.toString().includes('\\tA\\tC')"),
             "true"
         );
         assert_eq!(
-            eval_js(path, "variant.toString().includes('DP=10')"),
+            eval_js(&path, "variant.toString().includes('DP=10')"),
             "true"
         );
-        assert_eq!(eval_js(path, "variant.toString().endsWith('\\n')"), "false");
+        assert_eq!(
+            eval_js(&path, "variant.toString().endsWith('\\n')"),
+            "false"
+        );
     }
 }
