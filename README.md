@@ -49,6 +49,39 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 The following globals are available to the expression:
 
+- `Reader`: constructor for reading VCF/BCF
+  - `const r = new Reader(path)`
+  - Iterable: `for (const v of r) { ... }`
+  - `r.hasIndex() -> boolean`
+  - `r.header() -> header`
+  - `r.query(region)` (requires index)
+    - `region` form: `"chr"`, `"chr:100"`, `"chr:100-200"` (1-based inclusive)
+  - `r.query(chrom, start, end?)` (requires index)
+    - numeric form uses 0-based inclusive coordinates
+
+Example (iterate all records):
+
+```js
+const r = new Reader("tests/t.vcf.gz")
+let n = 0
+for (const v of r) {
+  n += 1
+}
+String(n)
+```
+
+Example (query if index present):
+
+```js
+const r = new Reader("tests/t.vcf.gz")
+if (r.hasIndex()) {
+  r.query("chr1:1000-2000")
+  for (const v of r) {
+    // ...
+  }
+}
+```
+
 - `header`: methods
   - `header.records() -> Array<object>`
   - `header.get(section, id) -> {id, type, number} | undefined` where `section` is `"INFO"` or `"FORMAT"`
