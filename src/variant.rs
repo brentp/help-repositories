@@ -661,7 +661,7 @@ mod tests {
         // Keep temp files isolated per-test.
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "v8_hts_{}_{}_{}",
+            "htsvcf_{}_{}_{}",
             std::process::id(),
             file_name,
             std::time::SystemTime::now()

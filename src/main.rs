@@ -2,10 +2,10 @@ type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// CLI entrypoint.
 ///
-/// Usage: `v8_hts <input.vcf|input.bcf> [js_expr]`.
+/// Usage: `htsvcf <input.vcf|input.bcf> [js_expr]`.
 fn main() -> Result<(), AnyError> {
     let mut args = std::env::args();
-    let program = args.next().unwrap_or_else(|| "v8_hts".to_string());
+    let program = args.next().unwrap_or_else(|| "htsvcf".to_string());
 
     let Some(path) = args.next() else {
         eprintln!("usage: {program} <input.vcf|input.bcf> [js_expr]");
@@ -14,5 +14,5 @@ fn main() -> Result<(), AnyError> {
     };
 
     let js_expr = args.next().unwrap_or_else(|| "variant.start".to_string());
-    v8_hts::runner::run_vcf_expr_to_stdout(&path, &js_expr, Default::default())
+    htsvcf::runner::run_vcf_expr_to_stdout(&path, &js_expr, Default::default())
 }

@@ -1,4 +1,4 @@
-//! `v8_hts` exposes HTSlib (VCF/BCF) records to V8.
+//! `htsvcf` exposes HTSlib (VCF/BCF) records to V8.
 //!
 //! The primary entrypoint is [`runner::run_vcf_expr_to_stdout`], which iterates
 //! records in a VCF/BCF and evaluates a JavaScript expression for each record.

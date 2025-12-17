@@ -1,11 +1,11 @@
-# v8_hts
+# htsvcf
 
 Expose HTSlib (VCF/BCF) records and header to JavaScript (V8).
 
 This crate builds both:
 
-- A Rust library (`v8_hts`) you can embed in your own program.
-- A small CLI (`v8_hts`) that evaluates a JS expression per record.
+- A Rust library (`htsvcf`) you can embed in your own program.
+- A small CLI (`htsvcf`) that evaluates a JS expression per record.
 
 ## CLI
 
@@ -24,12 +24,12 @@ The CLI prints the expression result (stringified) once per record.
 
 Add to your `Cargo.toml`:
 
-- `v8_hts = { path = "/path/to/v8_hts" }`
+- `htsvcf = { path = "/path/to/htsvcf" }`
 
 Minimal example:
 
 ```rust
-use v8_hts::runner::{run_vcf_expr_with, RunOptions};
+use htsvcf::runner::{run_vcf_expr_with, RunOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     run_vcf_expr_with(

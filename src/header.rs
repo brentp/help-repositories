@@ -395,7 +395,7 @@ mod tests {
     fn tmp_path(file_name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "v8_hts_{}_{}_{}",
+            "htsvcf_{}_{}_{}",
             std::process::id(),
             file_name,
             std::time::SystemTime::now()

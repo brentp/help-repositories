@@ -7,7 +7,7 @@ use crate::variant::{create_object_template as create_variant_template, create_v
 pub const READER_TAG: u16 = 3;
 const READER_TYPE_NAME: &[u8] = b"Reader\0";
 
-const OWNER_PRIVATE_KEY: &str = "v8_hts::Reader#owner";
+const OWNER_PRIVATE_KEY: &str = "htsvcf::Reader#owner";
 
 #[derive(Debug)]
 enum InnerReader {
