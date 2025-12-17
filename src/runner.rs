@@ -3,6 +3,7 @@ use rust_htslib::bcf::{self, Read};
 use crate::header::{create_header_object, Header};
 use crate::runtime;
 use crate::variant::{create_object_template, create_variant_object, Variant};
+use crate::reader;
 
 type AnyError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -69,6 +70,11 @@ where
     let global = context.global(scope);
     let header_name = v8::String::new(scope, "header").expect("failed to allocate v8 string");
     global.set(scope, header_name.into(), header_obj.into());
+
+    // Expose Reader(path) constructor.
+    let reader_ctor = reader::create_reader_constructor(scope);
+    let reader_name = v8::String::new(scope, "Reader").expect("failed to allocate v8 string");
+    global.set(scope, reader_name.into(), reader_ctor.into());
 
     let header_obj = global
         .get(scope, header_name.into())
