@@ -329,7 +329,7 @@ fn numeric_to_infovalue<T: Numeric + Copy>(
 
   match tag_length {
     TagLength::Fixed(1) => {
-      let v = values.iter().next().copied();
+      let v = values.first().copied();
       match v {
         Some(v) if v.is_missing() => InfoValue::Missing,
         Some(v) => scalar(v),
@@ -352,7 +352,9 @@ fn string_to_infovalue(values: Option<Vec<Vec<u8>>>, tag_length: TagLength) -> I
 
   match tag_length {
     TagLength::Fixed(1) => {
-      let v = values.iter().next().map(|s| String::from_utf8_lossy(s).into_owned());
+      let v = values
+        .first()
+        .map(|s| String::from_utf8_lossy(s).into_owned());
       match v {
         Some(v) if v.is_empty() => InfoValue::Missing,
         Some(v) => InfoValue::String(v),

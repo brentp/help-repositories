@@ -26,8 +26,11 @@ impl Header {
   ///
   /// This is important for thread safety and correct lifetime management: the
   /// returned `Header` owns its internal `bcf_hdr_t*` and frees it on drop.
-  pub fn new(inner: *mut rust_htslib::htslib::bcf_hdr_t) -> Self {
-    let inner = unsafe { rust_htslib::htslib::bcf_hdr_dup(inner) };
+  /// # Safety
+  ///
+  /// `inner` must be a valid pointer to a `bcf_hdr_t`.
+  pub unsafe fn new(inner: *mut rust_htslib::htslib::bcf_hdr_t) -> Self {
+    let inner = rust_htslib::htslib::bcf_hdr_dup(inner);
     Self {
       inner,
       dirty: AtomicBool::new(false),

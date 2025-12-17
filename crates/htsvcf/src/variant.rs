@@ -320,8 +320,7 @@ fn info_fn(
             match tag_length {
                 TagLength::Fixed(1) => {
                     let value = values
-                        .iter()
-                        .next()
+                        .first()
                         .map(|s| String::from_utf8_lossy(s).into_owned());
                     match value {
                         Some(v) => rv.set(v8::String::new(scope, &v).unwrap().into()),

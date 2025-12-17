@@ -22,7 +22,7 @@ impl Reader {
     let reader = core::open_reader(&path)
       .map_err(|e| Error::new(Status::GenericFailure, format!("failed to open {path}: {e}")))?;
 
-    let header = Arc::new(core::Header::new(reader.header_ptr()));
+    let header = Arc::new(unsafe { core::Header::new(reader.header_ptr()) });
     let header_ref = Header::into_reference(Header { inner: header.clone() }, env)?;
 
     Ok(Self {
@@ -99,7 +99,7 @@ impl Task for OpenReaderTask {
   }
 
   fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
-    let header = Arc::new(core::Header::new(output.header_ptr()));
+    let header = Arc::new(unsafe { core::Header::new(output.header_ptr()) });
     let header_ref = Header::into_reference(Header { inner: header.clone() }, env)?;
 
     Ok(Reader {
