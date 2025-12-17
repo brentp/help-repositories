@@ -1,5 +1,4 @@
 use rust_htslib::bcf::{self, Read};
-use v8;
 
 mod variant;
 
@@ -13,7 +12,8 @@ const GC_EVERY: usize = 100_000;
 fn maybe_force_gc(scope: &mut v8::PinScope<'_, '_>) {
     scope.request_garbage_collection_for_testing(v8::GarbageCollectionType::Full);
     unsafe {
-        scope.get_cpp_heap()
+        scope
+            .get_cpp_heap()
             .unwrap()
             .collect_garbage_for_testing(v8::cppgc::EmbedderStackState::MayContainHeapPointers);
     }
@@ -90,4 +90,3 @@ fn main() -> Result<(), AnyError> {
     let js_expr = args.next().unwrap_or_else(|| "variant.start".to_string());
     run(&path, &js_expr)
 }
-

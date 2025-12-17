@@ -1,24 +1,9 @@
 use rust_htslib::bcf;
 use rust_htslib::bcf::header::{TagLength, TagType};
 use rust_htslib::bcf::record::Numeric;
-use v8;
 
 pub const TAG: u16 = 1;
 const VARIANT_TYPE_NAME: &[u8] = b"Variant\0";
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum InfoField<T> {
-    Scalar(Option<T>),
-    Array(Vec<Option<T>>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum InfoValue {
-    Flag(bool),
-    Integer(InfoField<i32>),
-    Float(InfoField<f32>),
-    String(InfoField<String>),
-}
 
 #[derive(Debug)]
 pub struct Variant {
@@ -85,51 +70,6 @@ impl Variant {
         } else {
             Some(qual)
         }
-    }
-
-    pub fn info(&self, tag: &[u8]) -> Result<Option<InfoValue>, Box<dyn std::error::Error>> {
-        let (tag_type, tag_length) = self.record.header().info_type(tag)?;
-
-        match tag_type {
-            TagType::Flag => Ok(Some(InfoValue::Flag(self.record.info(tag).flag()?))),
-            TagType::Integer => {
-                let Some(values) = self.record.info(tag).integer()? else {
-                    return Ok(None);
-                };
-                let values = values
-                    .iter()
-                    .map(|v| if v.is_missing() { None } else { Some(*v) })
-                    .collect::<Vec<_>>();
-                Ok(Some(InfoValue::Integer(cardinality(values, tag_length))))
-            }
-            TagType::Float => {
-                let Some(values) = self.record.info(tag).float()? else {
-                    return Ok(None);
-                };
-                let values = values
-                    .iter()
-                    .map(|v| if v.is_missing() { None } else { Some(*v) })
-                    .collect::<Vec<_>>();
-                Ok(Some(InfoValue::Float(cardinality(values, tag_length))))
-            }
-            TagType::String => {
-                let Some(values) = self.record.info(tag).string()? else {
-                    return Ok(None);
-                };
-                let values = values
-                    .iter()
-                    .map(|s| Some(String::from_utf8_lossy(s).into_owned()))
-                    .collect::<Vec<_>>();
-                Ok(Some(InfoValue::String(cardinality(values, tag_length))))
-            }
-        }
-    }
-}
-
-fn cardinality<T>(values: Vec<Option<T>>, tag_length: TagLength) -> InfoField<T> {
-    match tag_length {
-        TagLength::Fixed(1) => InfoField::Scalar(values.into_iter().next().unwrap_or(None)),
-        _ => InfoField::Array(values),
     }
 }
 
@@ -226,7 +166,7 @@ fn attr_getter(
         _ => {
             let message = v8::String::new(scope, "Invalid key").unwrap();
             let error = v8::Exception::error(scope, message);
-            rv.set(error.into());
+            rv.set(error);
         }
     }
 }
@@ -252,8 +192,9 @@ fn info_fn(
         return;
     };
     let tag = tag_str.to_rust_string_lossy(scope);
+    let tag_bytes = tag.as_bytes();
 
-    let value = match variant.info(tag.as_bytes()) {
+    let (tag_type, tag_length) = match variant.record.header().info_type(tag_bytes) {
         Ok(v) => v,
         Err(_) => {
             rv.set(v8::undefined(scope).into());
@@ -261,41 +202,88 @@ fn info_fn(
         }
     };
 
-    match value {
-        None => rv.set(v8::undefined(scope).into()),
-        Some(InfoValue::Flag(b)) => rv.set(v8::Boolean::new(scope, b).into()),
-        Some(InfoValue::Integer(field)) => rv.set(field_to_value(scope, field, |scope, v| {
-            v8::Number::new(scope, v as f64).into()
-        })),
-        Some(InfoValue::Float(field)) => rv.set(field_to_value(scope, field, |scope, v| {
-            v8::Number::new(scope, v as f64).into()
-        })),
-        Some(InfoValue::String(field)) => rv.set(field_to_value(scope, field, |scope, v| {
-            v8::String::new(scope, &v).unwrap().into()
-        })),
+    match tag_type {
+        TagType::Flag => match variant.record.info(tag_bytes).flag() {
+            Ok(v) => rv.set(v8::Boolean::new(scope, v).into()),
+            Err(_) => rv.set(v8::undefined(scope).into()),
+        },
+        TagType::Integer => {
+            let Ok(Some(values)) = variant.record.info(tag_bytes).integer() else {
+                rv.set(v8::undefined(scope).into());
+                return;
+            };
+
+            info_numeric_to_value(scope, &values, tag_length, &mut rv, |scope, v| {
+                v8::Number::new(scope, v as f64).into()
+            });
+        }
+        TagType::Float => {
+            let Ok(Some(values)) = variant.record.info(tag_bytes).float() else {
+                rv.set(v8::undefined(scope).into());
+                return;
+            };
+
+            info_numeric_to_value(scope, &values, tag_length, &mut rv, |scope, v| {
+                v8::Number::new(scope, v as f64).into()
+            });
+        }
+        TagType::String => {
+            let Ok(Some(values)) = variant.record.info(tag_bytes).string() else {
+                rv.set(v8::undefined(scope).into());
+                return;
+            };
+
+            match tag_length {
+                TagLength::Fixed(1) => {
+                    let value = values
+                        .iter()
+                        .next()
+                        .map(|s| String::from_utf8_lossy(s).into_owned());
+                    match value {
+                        Some(v) => rv.set(v8::String::new(scope, &v).unwrap().into()),
+                        None => rv.set(v8::null(scope).into()),
+                    }
+                }
+                _ => {
+                    let arr = v8::Array::new(scope, values.len() as i32);
+                    for (i, v) in values.iter().enumerate() {
+                        let v = v8::String::new(scope, &String::from_utf8_lossy(v)).unwrap();
+                        arr.set_index(scope, i as u32, v.into());
+                    }
+                    rv.set(arr.into());
+                }
+            }
+        }
     }
 }
 
-fn field_to_value<'s, 'i, T>(
+fn info_numeric_to_value<'s, 'i, T: Numeric + Copy>(
     scope: &mut v8::PinScope<'s, 'i>,
-    field: InfoField<T>,
+    values: &[T],
+    tag_length: TagLength,
+    rv: &mut v8::ReturnValue,
     mut to_value: impl FnMut(&mut v8::PinScope<'s, 'i>, T) -> v8::Local<'s, v8::Value>,
-) -> v8::Local<'s, v8::Value> {
-    match field {
-        InfoField::Scalar(v) => match v {
-            Some(v) => to_value(scope, v),
-            None => v8::null(scope).into(),
-        },
-        InfoField::Array(values) => {
+) {
+    match tag_length {
+        TagLength::Fixed(1) => {
+            let value = values.iter().next().copied();
+            match value {
+                Some(v) if v.is_missing() => rv.set(v8::null(scope).into()),
+                Some(v) => rv.set(to_value(scope, v)),
+                None => rv.set(v8::null(scope).into()),
+            }
+        }
+        _ => {
             let arr = v8::Array::new(scope, values.len() as i32);
-            for (i, v) in values.into_iter().enumerate() {
-                let v = match v {
-                    Some(v) => to_value(scope, v),
-                    None => v8::null(scope).into(),
+            for (i, v) in values.iter().copied().enumerate() {
+                let v = if v.is_missing() {
+                    v8::null(scope).into()
+                } else {
+                    to_value(scope, v)
                 };
                 arr.set_index(scope, i as u32, v);
             }
-            arr.into()
+            rv.set(arr.into());
         }
     }
 }
@@ -418,41 +406,23 @@ mod tests {
 #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n\
 chr1\t1\t.\tA\tC,G\t.\t.\tDP=7;AF=0.1,0.2;NOTE=hi;FLAGS=a,b,c;SOMATIC\n";
         fs::write(&path, vcf).unwrap();
+        let path = path.to_str().unwrap();
 
-        let mut reader = bcf::Reader::from_path(&path).unwrap();
-        let record = reader.records().next().unwrap().unwrap();
-        let variant = Variant::from_record(record);
-
+        assert_eq!(eval_js(path, "variant.info('DP')"), "7");
+        assert_eq!(eval_js(path, "variant.info('AF').length"), "2");
         assert_eq!(
-            variant.info(b"DP").unwrap(),
-            Some(InfoValue::Integer(InfoField::Scalar(Some(7))))
+            eval_js(path, "Math.abs(variant.info('AF')[0] - 0.1) < 1e-6",),
+            "true"
         );
-
-        match variant.info(b"AF").unwrap() {
-            Some(InfoValue::Float(InfoField::Array(values))) => {
-                assert_eq!(values.len(), 2);
-                assert!((values[0].unwrap() - 0.1).abs() < 1e-6);
-                assert!((values[1].unwrap() - 0.2).abs() < 1e-6);
-            }
-            other => panic!("unexpected AF value: {other:?}"),
-        }
-
         assert_eq!(
-            variant.info(b"NOTE").unwrap(),
-            Some(InfoValue::String(InfoField::Scalar(Some("hi".to_string()))))
+            eval_js(path, "Math.abs(variant.info('AF')[1] - 0.2) < 1e-6",),
+            "true"
         );
+        assert_eq!(eval_js(path, "variant.info('NOTE')"), "hi");
+        assert_eq!(eval_js(path, "variant.info('FLAGS').length"), "3");
+        assert_eq!(eval_js(path, "variant.info('FLAGS')[2]"), "c");
+        assert_eq!(eval_js(path, "variant.info('SOMATIC')"), "true");
 
-        assert_eq!(
-            variant.info(b"FLAGS").unwrap(),
-            Some(InfoValue::String(InfoField::Array(vec![
-                Some("a".to_string()),
-                Some("b".to_string()),
-                Some("c".to_string()),
-            ])))
-        );
-
-        assert_eq!(variant.info(b"SOMATIC").unwrap(), Some(InfoValue::Flag(true)));
-
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path);
     }
 }
