@@ -337,8 +337,8 @@ mod tests {
     }
 
     fn eval_header_js(path: &str, js_expr: &str) -> String {
-        let platform = crate::testutil::ensure_v8_initialized().clone();
-        let _guard = crate::testutil::v8_lock();
+        let platform = crate::runtime::ensure_v8_initialized().clone();
+        let _guard = crate::runtime::v8_lock();
 
         let heap = v8::cppgc::Heap::create(platform, v8::cppgc::HeapCreateParams::default());
         let isolate = &mut v8::Isolate::new(v8::CreateParams::default().cpp_heap(heap));
